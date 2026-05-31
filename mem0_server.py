@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Mem0 memory lifecycle management server — reference implementation.
+
+This script adds access frequency tracking, exponential decay scoring,
+and automated cleanup of stale memories on top of the Mem0 SDK.
+
+Usage:
+    python mem0_server.py <action> [args...]
+
+Actions:
+    search <query> <user_id> [top_k] [rerank]    # Search memories (auto-tracks access)
+    add <json_messages> <user_id> <agent_id>     # Add new memory
+    get_all <user_id>                            # Get all memories
+    profile <user_id>                            # Get user profile memories
+    stats [user_id]                              # Show access statistics
+    least_used [user_id] [top_n]                 # Show least-used memories
+    cleanup [--dry-run] [--threshold X] [user_id] # Remove stale memories below threshold
+
+Cleanup config:
+    Default threshold: 0.05 (weighted_score)
+    Half-life: 7 days
+    Grace period: newly created memories (< 14 days old) are protected
+    No hard protection by access count — exponential decay handles all cases
+"""
+
+import json
+import sys
+from datetime import datetime, timezone
+
+from mem0 import Memory
+from qdrant_client import QdrantClient
+
+# --- Tunable parameters ---
+
+HALF_LIFE_DAYS = 7.0       # Exponential decay half-life (days)
+CLEANUP_THRESHOLD = 0.05   # Memories with weighted_score < this are candidates for deletion
+ACCESS_COUNT_CAP = 255     # Hard cap on access_count — prevents unbounded growth
+
+
+def compute_weighted_score(access_count, last_accessed_iso):
+    """Exponential decay: score = min(count, CAP) * 0.5^(days_since / half_life)
+
+    Prevents infinite inflation: access_count is capped at 255, so even a
+    memory searched thousands of times has a bounded score.
+    Combined with half-life decay, old memories naturally fade to zero.
+
+    Timestamp parsing uses Python native fromisoformat + tzinfo check for
+    robust handling of UTC, timezone-aware, naive, Z-suffix, and negative-offset
+    ISO strings. On parse failure, returns 0.0 (expired) to avoid immortal zombies.
+
+    Examples (half_life=7 days):
+    - 3 accesses today -> 3.0
+    - 10 accesses, last seen 21 days ago -> 1.25
+    - 1 access, last seen 33 days ago -> ~0.05 (cleanup threshold)
+    """
+    if not access_count or not last_accessed_iso or last_accessed_iso == 'never':
+        return 0.0
+    try:
+        ts = last_accessed_iso.replace('Z', '+00:00')
+        last_dt = datetime.fromisoformat(ts)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        days = max(0, (now - last_dt).total_seconds() / 86400)
+        return float(min(access_count, ACCESS_COUNT_CAP)) * (0.5 ** (days / HALF_LIFE_DAYS))
+    except Exception:
+        # Timestamp parse failure -> treat as expired to avoid immortal zombies
+        return 0.0
+
+
+def get_memory_client():
+    """Create Memory client with local config.
+
+    Replace the values below with your own deployment settings.
+    See https://docs.mem0.ai/quick-start for full configuration options.
+    """
+    config = {
+        'llm': {
+            'provider': 'openai',
+            'config': {
+                'api_key': 'your-api-key-here',
+                'openai_base_url': 'http://localhost:1234/v1',
+                'model': 'qwen3'
+            }
+        },
+        'embedder': {
+            'provider': 'huggingface',
+            'config': {
+                'model': '/path/to/embedding-model'
+            }
+        },
+        'vector_store': {
+            'provider': 'qdrant',
+            'config': {
+                'collection_name': 'mem0',
+                'embedding_model_dims': 1024,
+                'host': 'localhost',
+                'port': 6333
+            }
+        },
+        'custom_instructions': """
+## Storage Rules (Highest Priority)
+
+This is a working AI assistant. Only store information that retains value across sessions.
+
+STORE:
+- User preferences, habits, style requirements
+- Iron rules, red lines, taboos
+- Environment facts: tool paths, service ports, venv locations
+- Technical decisions and architecture choices
+- Verified stable patterns and pitfalls
+- User identity and project information
+
+DO NOT STORE:
+- Single-session task progress or intermediate state
+- Code modification logs (belong in skills, not memory)
+- One-time debugging conclusions (unless verified as a stable pattern)
+- Emotional descriptions ("nervous", "frustrated")
+- Temporary file paths, commit SHAs, PR numbers, branch names
+- Content already fully covered by USER.md or skills
+- Speculation or unconfirmed hypotheses
+"""
+    }
+    return Memory.from_config(config)
+
+
+def get_access_payload(qdrant, mem_id):
+    """Fetch access_count and last_accessed_at for a memory from Qdrant."""
+    try:
+        pt = qdrant.retrieve(collection_name='mem0', ids=[str(mem_id)], with_payload=True)
+        if pt:
+            p = pt[0].payload
+            return p.get('access_count', 0), p.get('last_accessed_at', 'never')
+    except Exception:
+        pass
+    return 0, 'never'
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "Usage: mem0_server.py <action> [args...]"}))
+        sys.exit(1)
+
+    action = sys.argv[1]
+
+    try:
+        client = get_memory_client()
+
+        if action == "search":
+            query = sys.argv[2]
+            user_id = sys.argv[3]
+            top_k = int(sys.argv[4]) if len(sys.argv) > 4 else 10
+            rerank = sys.argv[5] == "true" if len(sys.argv) > 5 else False
+
+            results = client.search(
+                query=query,
+                filters={'user_id': user_id},
+                top_k=top_k,
+                rerank=rerank,
+                threshold=0.4
+            )
+
+            # Track access frequency for each matched memory
+            if results:
+                results_list = results.get('results', []) if isinstance(results, dict) else results
+                if results_list:
+                    qdrant = QdrantClient(host='localhost', port=6333)
+                    now = datetime.now(timezone.utc).isoformat()
+                    for r in results_list:
+                        mem_id = str(r.get('id', ''))
+                        if mem_id:
+                            try:
+                                ac, _ = get_access_payload(qdrant, mem_id)
+                                qdrant.set_payload(
+                                    collection_name='mem0',
+                                    payload={
+                                        'access_count': min(ac + 1, ACCESS_COUNT_CAP),
+                                        'last_accessed_at': now
+                                    },
+                                    points=[mem_id]
+                                )
+                            except Exception:
+                                pass
+
+            print(json.dumps(results))
+
+        elif action == "add":
+            messages_json = sys.argv[2]
+            user_id = sys.argv[3]
+            agent_id = sys.argv[4]
+
+            messages = json.loads(messages_json)
+            client.add(messages, user_id=user_id, agent_id=agent_id)
+            print(json.dumps({"result": "Fact stored."}))
+
+        elif action == "get_all":
+            user_id = sys.argv[2]
+            memories = client.get_all(filters={'user_id': user_id})
+            print(json.dumps(memories))
+
+        elif action == "profile":
+            user_id = sys.argv[2]
+            memories = client.get_all(filters={'user_id': user_id})
+            if isinstance(memories, dict):
+                memories = memories.get("results", [])
+            lines = [m.get("memory", "") for m in memories if m.get("memory")]
+            print(json.dumps({
+                "result": "\n".join(lines),
+                "count": len(lines)
+            }))
+
+        elif action == "stats":
+            user_id = sys.argv[2] if len(sys.argv) > 2 else "example-user"
+            qdrant = QdrantClient(host='localhost', port=6333)
+
+            all_mems = client.get_all(filters={'user_id': user_id})
+            results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
+
+            total = len(results)
+            with_access = 0
+            never_accessed = 0
+            max_access = 0
+            total_access = 0
+
+            for m in results:
+                mem_id = str(m.get('id', ''))
+                ac, _ = get_access_payload(qdrant, mem_id)
+                total_access += ac
+                if ac > 0:
+                    with_access += 1
+                else:
+                    never_accessed += 1
+                if ac > max_access:
+                    max_access = ac
+
+            avg_access = total_access / with_access if with_access > 0 else 0
+
+            # Compute weighted scores with exponential decay
+            total_weighted = 0.0
+            max_weighted = 0.0
+            for m in results:
+                mem_id = str(m.get('id', ''))
+                ac, la = get_access_payload(qdrant, mem_id)
+                w = compute_weighted_score(ac, la)
+                total_weighted += w
+                max_weighted = max(max_weighted, w)
+
+            avg_weighted = total_weighted / with_access if with_access > 0 else 0
+
+            print(json.dumps({
+                'total_memories': total,
+                'never_accessed': never_accessed,
+                'with_access': with_access,
+                'avg_access_raw': round(avg_access, 2),
+                'max_access_raw': max_access,
+                'total_accesses': total_access,
+                'avg_weighted_score': round(avg_weighted, 4),
+                'max_weighted_score': round(max_weighted, 4),
+                'half_life_days': int(HALF_LIFE_DAYS)
+            }))
+
+        elif action == "least_used":
+            user_id = sys.argv[2] if len(sys.argv) > 2 else "example-user"
+            top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+            qdrant = QdrantClient(host='localhost', port=6333)
+
+            all_mems = client.get_all(filters={'user_id': user_id})
+            results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
+
+            with_stats = []
+            for m in results:
+                mem_id = str(m.get('id', ''))
+                ac, la = get_access_payload(qdrant, mem_id)
+                w = compute_weighted_score(ac, la)
+                with_stats.append({
+                    'id': mem_id,
+                    'memory': m.get('memory', '')[:120],
+                    'access_count': ac,
+                    'last_accessed_at': la,
+                    'weighted_score': round(w, 4),
+                    'created_at': m.get('created_at', '')
+                })
+
+            with_stats.sort(key=lambda x: x['weighted_score'])
+            print(json.dumps(with_stats[:top_n], indent=2))
+
+        elif action == "cleanup":
+            # Parse arguments: cleanup [--dry-run] [--threshold X] [user_id]
+            args = sys.argv[2:]
+            dry_run = '--dry-run' in args
+            user_id = 'example-user'
+            threshold = CLEANUP_THRESHOLD
+
+            # Parse optional threshold
+            for i, arg in enumerate(args):
+                if arg == '--threshold' and i + 1 < len(args):
+                    threshold = float(args[i + 1])
+                elif arg not in ('--dry-run', '--threshold') and not arg.startswith('-'):
+                    user_id = arg
+
+            qdrant = QdrantClient(host='localhost', port=6333)
+
+            all_mems = client.get_all(filters={'user_id': user_id})
+            results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
+
+            candidates = []
+            kept = []
+
+            for m in results:
+                mem_id = str(m.get('id', ''))
+                ac, la = get_access_payload(qdrant, mem_id)
+                w = compute_weighted_score(ac, la)
+
+                # Grace period: newly created memories (< 14 days old) are protected
+                grace_protected = False
+                created_at = m.get('created_at', '')
+                if created_at:
+                    try:
+                        ca_ts = created_at.replace('Z', '+00:00')
+                        ca_dt = datetime.fromisoformat(ca_ts)
+                        if ca_dt.tzinfo is None:
+                            ca_dt = ca_dt.replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        days_old = (now - ca_dt).total_seconds() / 86400
+                        grace_protected = days_old < 14
+                    except Exception:
+                        # If timestamp parsing fails, default to protecting the memory
+                        # to avoid accidentally deleting newly created entries
+                        grace_protected = True
+
+                entry = {
+                    'id': mem_id,
+                    'memory': m.get('memory', '')[:120],
+                    'access_count': ac,
+                    'weighted_score': round(w, 4),
+                    'last_accessed_at': la,
+                    'grace_protected': grace_protected
+                }
+
+                if w < threshold and not grace_protected:
+                    candidates.append(entry)
+                else:
+                    entry['reason'] = 'grace_period' if grace_protected else f'score {w:.4f} >= threshold {threshold}'
+                    kept.append(entry)
+
+            # Sort candidates by weighted score (lowest first)
+            candidates.sort(key=lambda x: x['weighted_score'])
+
+            if dry_run:
+                output = {
+                    'mode': 'DRY_RUN',
+                    'threshold': threshold,
+                    'half_life_days': int(HALF_LIFE_DAYS),
+                    'to_delete': len(candidates),
+                    'kept': len(kept),
+                    'candidates': candidates
+                }
+                print(json.dumps(output, indent=2))
+            else:
+                # Delete via Mem0 SDK (synchronizes both metadata layer AND Qdrant vector store)
+                deleted_ids = []
+                failed_ids = []
+                for c in candidates:
+                    try:
+                        client.delete(memory_id=c['id'])
+                        deleted_ids.append(c['id'])
+                    except Exception as e:
+                        failed_ids.append({'id': c['id'], 'error': str(e)})
+
+                output = {
+                    'mode': 'EXECUTED',
+                    'threshold': threshold,
+                    'deleted_count': len(deleted_ids),
+                    'deleted_ids': deleted_ids,
+                    'failed': failed_ids,
+                    'kept_count': len(kept)
+                }
+                print(json.dumps(output, indent=2))
+
+        else:
+            print(json.dumps({"error": f"Unknown action: {action}"}))
+            sys.exit(1)
+
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
