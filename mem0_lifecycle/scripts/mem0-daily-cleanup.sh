@@ -1,28 +1,26 @@
 #!/bin/bash
-# Mem0 daily cleanup script — designed for systemd ExecStartPre integration
-# 
-# This script runs cleanup at most once per day using a date marker file.
-# On success, the marker is updated with today's date. On failure, no marker
-# update occurs so it will retry on next service start.
-
-set -e
+# Mem0 daily cleanup: async background execution via systemd-run.
+# Gateway starts instantly; cleanup runs in background without blocking.
+# Only runs once per day (date marker: /tmp/.mem0_cleanup_date).
 
 MARKER="/tmp/.mem0_cleanup_date"
 TODAY=$(date +%Y-%m-%d)
-CLEANED=$(cat "$MARKER" 2>/dev/null || echo "")
+CLEANED=$(cat "$MARKER" 2>/dev/null)
 
 if [ "$TODAY" = "$CLEANED" ]; then
     # Already cleaned today — skip
     exit 0
 fi
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running Mem0 lifecycle cleanup..."
+# Fire-and-forget: spawn cleanup in a background scope.
+# Gateway continues starting immediately regardless of cleanup outcome.
+systemd-run --user --scope --unit=mem0-cleanup-bg /bin/bash -c "
+    cd /media/data/mem0 && source .venv/bin/activate && python mem0_server.py cleanup 2>&1 | systemd-cat -t mem0-cleanup
+    if [ \$? -eq 0 ]; then
+        echo '$TODAY' > '$MARKER'
+    else
+        logger -t mem0-cleanup 'Cleanup failed in background'
+    fi
+"
 
-# Run cleanup
-if cd /path/to/mem0-deployment && python -m mem0_lifecycle.cleanup >> /tmp/mem0_cleanup.log 2>&1; then
-    echo "$TODAY" > "$MARKER"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleanup completed successfully"
-else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleanup failed — will retry on next start" >&2
-    exit 1
-fi
+exit 0
