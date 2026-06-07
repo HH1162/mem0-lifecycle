@@ -8,13 +8,15 @@ Usage:
     python mem0_server.py <action> [args...]
 
 Actions:
-    search <query> <user_id> [top_k] [rerank]    # Search memories (auto-tracks access)
-    add <json_messages> <user_id> <agent_id>     # Add new memory
-    get_all <user_id>                            # Get all memories
-    profile <user_id>                            # Get user profile memories
-    stats [user_id]                              # Show access statistics
-    least_used [user_id] [top_n]                 # Show least-used memories
-    cleanup [--dry-run] [--threshold X] [user_id] # Remove stale memories below threshold
+    search <query> <user_id> [top_k] [rerank] [--no-track]  # Search memories (auto-tracks unless --no-track)
+    add <json_messages> <user_id> <agent_id>                # Add new memory
+    track <json_ids>                                        # Full track: update last_accessed_at + increment access_count
+    touch <json_ids>                                        # Touch only: update last_accessed_at (no access_count change)
+    get_all <user_id>                                      # Get all memories
+    profile <user_id>                                      # Get user profile memories
+    stats [user_id]                                        # Show access statistics
+    least_used [user_id] [top_n]                           # Show least-used memories
+    cleanup [--dry-run] [--threshold X] [user_id]          # Remove stale memories below threshold
 
 Cleanup config:
     Default threshold: 0.05 (weighted_score)
@@ -75,90 +77,73 @@ def get_anchor_time():
     return datetime(MIN_VALID_YEAR, 1, 1, tzinfo=timezone.utc)
 
 
+def _load_state():
+    """Load state from STATE_FILE, return dict."""
+    try:
+        if os.path.exists(STATE_FILE):
+            return json.loads(open(STATE_FILE).read())
+    except Exception:
+        pass
+    return {}
+
+def _save_state(state):
+    """Atomically save state to STATE_FILE."""
+    try:
+        tmp = STATE_FILE + ".tmp"
+        open(tmp, 'w').write(json.dumps(state, indent=2))
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        print(f"[mem0] Warning: save_state failed: {e}", file=sys.stderr)
+
 def update_anchor_time():
     """Called on search/add to advance the time anchor.
 
     Only invoked when the user is actively interacting with the system.
     During downtime, this is never called, so the anchor stays frozen.
 
-    Offline gap handling:
+    Offline gap handling (Global Time Offset):
     If the gap between old anchor and now exceeds 36 hours (machine was offline),
-    we shift ALL last_accessed_at timestamps in Qdrant forward by the gap duration.
-    This preserves the relative distance between anchor and last_accessed_at,
-    preventing offline time from being counted as "memory idle time".
+    we accumulate the gap into time_offset_days. This offset is subtracted from
+    effective_days during decay calculation, preventing offline time from being
+    counted as "memory idle time".
+
+    Key advantage: O(1) operation, no Qdrant writes needed, naturally idempotent.
 
     Example: machine off for 30 days
-      Before: last_accessed_at=Day0, anchor=Day0 → effective_days=0
-      After:  last_accessed_at=Day30, anchor=Day30 → effective_days=0 ✓
+      raw_days = (now - last_accessed_at).days = 30
+      time_offset_days = 30
+      effective_days = max(0, 30 - 30) = 0 ✓
     """
-    from datetime import timedelta
-
     try:
         now = datetime.now(timezone.utc)
+        state = _load_state()
 
         # Read old anchor
         old_anchor = None
-        if os.path.exists(STATE_FILE):
+        ts = state.get("last_active", "")
+        if ts:
             try:
-                state = json.loads(open(STATE_FILE).read())
-                ts = state.get("last_active", "")
-                if ts:
-                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    if dt.year >= 2024:
-                        old_anchor = dt
+                dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt.year >= 2024:
+                    old_anchor = dt
             except Exception:
                 pass
 
-        # If no valid old anchor, just write now and return
-        if old_anchor is None:
-            state = {"last_active": now.isoformat()}
-            tmp = STATE_FILE + ".tmp"
-            open(tmp, 'w').write(json.dumps(state, indent=2))
-            os.replace(tmp, STATE_FILE)
-            return
+        # Calculate gap and accumulate offset
+        if old_anchor is not None:
+            gap_seconds = (now - old_anchor).total_seconds()
+            gap_hours = gap_seconds / 3600
 
-        # Calculate gap
-        gap_seconds = (now - old_anchor).total_seconds()
-        gap_hours = gap_seconds / 3600
-
-        if gap_hours > 36:
-            # Machine was offline for more than 1.5 days.
-            # Shift all last_accessed_at timestamps forward by gap days.
-            gap_days = gap_seconds / 86400
-
-            try:
-                qdrant = QdrantClient(host='localhost', port=6333)
-                # Scroll returns (points_list, next_offset), not count
-                points, next_offset = qdrant.scroll(collection_name='mem0', limit=1000, with_payload=True)
-                shifted = 0
-                for pt in points:
-                    payload = pt.payload or {}
-                    la = payload.get('last_accessed_at')
-                    if la and la != 'never':
-                        try:
-                            la_dt = datetime.fromisoformat(la.replace('Z', '+00:00'))
-                            if la_dt.tzinfo is None:
-                                la_dt = la_dt.replace(tzinfo=timezone.utc)
-                            new_la = la_dt + timedelta(days=gap_days)
-                            qdrant.set_payload(
-                                collection_name='mem0',
-                                payload={'last_accessed_at': new_la.isoformat()},
-                                points=[str(pt.id)]
-                            )
-                            shifted += 1
-                        except Exception:
-                            pass
-                print(f"[mem0] Offline gap={gap_hours:.0f}h, shifted {shifted} memories by +{gap_days:.1f} days", file=sys.stderr)
-            except Exception as e:
-                print(f"[mem0] Warning: failed to shift timestamps after {gap_hours:.0f}h gap: {e}", file=sys.stderr)
+            if gap_hours > 36:
+                gap_days = gap_seconds / 86400
+                state['time_offset_days'] = state.get('time_offset_days', 0.0) + gap_days
+                print(f"[mem0] Offline gap={gap_hours:.0f}h, accumulated offset={state['time_offset_days']:.1f} days", file=sys.stderr)
 
         # Update anchor to now
-        state = {"last_active": now.isoformat()}
-        tmp = STATE_FILE + ".tmp"
-        open(tmp, 'w').write(json.dumps(state, indent=2))
-        os.replace(tmp, STATE_FILE)
+        state['last_active'] = now.isoformat()
+        _save_state(state)
 
     except Exception as e:
         # Never block search/add on anchor update failure
@@ -171,7 +156,9 @@ def compute_weighted_score(access_count, last_accessed_iso, anchor_time=None):
 
     score = min(access_count, CAP) * 0.5^(effective_days / half_life)
 
-    effective_days = (anchor_time - last_accessed_at)
+    effective_days = max(0, raw_days - time_offset_days)
+    where raw_days = (anchor_time - last_accessed_at)
+    and time_offset_days is accumulated offline gap (prevents offline snowball decay)
 
     When anchor_time is None, defaults to current wall-clock time.
     During cleanup/stats, anchor_time is explicitly passed to ensure
@@ -201,8 +188,14 @@ def compute_weighted_score(access_count, last_accessed_iso, anchor_time=None):
         elif anchor_time.tzinfo is None:
             anchor_time = anchor_time.replace(tzinfo=timezone.utc)
 
-        days = max(0, (anchor_time - last_dt).total_seconds() / 86400)
-        return float(min(access_count, ACCESS_COUNT_CAP)) * (0.5 ** (days / HALF_LIFE_DAYS))
+        raw_days = max(0, (anchor_time - last_dt).total_seconds() / 86400)
+
+        # Subtract accumulated offline gap offset
+        state = _load_state()
+        time_offset = state.get('time_offset_days', 0.0)
+        effective_days = max(0, raw_days - time_offset)
+
+        return float(min(access_count, ACCESS_COUNT_CAP)) * (0.5 ** (effective_days / HALF_LIFE_DAYS))
     except Exception:
         # Timestamp parse failure -> treat as expired to avoid immortal zombies
         return 0.0
@@ -306,18 +299,23 @@ def main():
 
     action = sys.argv[1]
 
-    # Advance time anchor on user-facing actions (search/add)
-    if action in ("search", "add"):
+    # Advance time anchor on user-facing actions (search/add/track/touch)
+    if action in ("search", "add", "track", "touch"):
         update_anchor_time()
 
     try:
-        client = get_memory_client()
+        # Only load Memory client for actions that need it (search, add, get_all, profile, stats, least_used, cleanup)
+        # track/touch only need Qdrant — skip the expensive client init (BGE model load)
+        client = None
+        if action not in ("track", "touch"):
+            client = get_memory_client()
 
         if action == "search":
             query = sys.argv[2]
             user_id = sys.argv[3]
             top_k = int(sys.argv[4]) if len(sys.argv) > 4 else 10
             rerank = sys.argv[5] == "true" if len(sys.argv) > 5 else False
+            no_track = len(sys.argv) > 6 and sys.argv[6] == "--no-track"
 
             results = client.search(
                 query=query,
@@ -327,8 +325,8 @@ def main():
                 threshold=0.1
             )
 
-            # Track access frequency for each matched memory
-            if results:
+            # Track access frequency for each matched memory (unless --no-track)
+            if results and not no_track:
                 results_list = results.get('results', []) if isinstance(results, dict) else results
                 if results_list:
                     qdrant = QdrantClient(host='localhost', port=6333)
@@ -351,13 +349,115 @@ def main():
 
             print(json.dumps(results, default=str))
 
+        elif action == "track":
+            # Full track: update last_accessed_at AND increment access_count
+            # NOTE: No Memory client needed — direct Qdrant access only
+            mem_ids_json = sys.argv[2]
+            mem_ids = json.loads(mem_ids_json)
+            
+            qdrant = QdrantClient(host='localhost', port=6333)
+            now = datetime.now(timezone.utc).isoformat()
+            
+            # Batch retrieve all payloads first (avoids N+1 queries)
+            payload_map = {}
+            try:
+                pts = qdrant.retrieve(
+                    collection_name='mem0',
+                    ids=[str(mid) for mid in mem_ids],
+                    with_payload=True
+                )
+                for p in pts:
+                    payload = p.payload or {}
+                    payload_map[str(p.id)] = payload.get('access_count', 0)
+            except Exception as e:
+                print(f"Warning: batch retrieve failed in track: {e}", file=sys.stderr)
+            
+            tracked = 0
+            for mem_id in mem_ids:
+                try:
+                    ac = payload_map.get(str(mem_id), 0)
+                    qdrant.set_payload(
+                        collection_name='mem0',
+                        payload={
+                            'access_count': min(ac + 1, ACCESS_COUNT_CAP),
+                            'last_accessed_at': now
+                        },
+                        points=[str(mem_id)]
+                    )
+                    tracked += 1
+                except Exception as e:
+                    print(f"Warning: track failed for {mem_id}: {e}", file=sys.stderr)
+            
+            print(json.dumps({"result": f"Tracked {tracked} memories"}))
+
+        elif action == "touch":
+            # Touch only: update last_accessed_at, do NOT change access_count
+            # Used for shadow memories (pure duplicates that should decay naturally)
+            # NOTE: No Memory client needed — direct Qdrant access only
+            mem_ids_json = sys.argv[2]
+            mem_ids = json.loads(mem_ids_json)
+            
+            qdrant = QdrantClient(host='localhost', port=6333)
+            now = datetime.now(timezone.utc).isoformat()
+            touched = 0
+            for mem_id in mem_ids:
+                try:
+                    qdrant.set_payload(
+                        collection_name='mem0',
+                        payload={'last_accessed_at': now},
+                        points=[str(mem_id)]
+                    )
+                    touched += 1
+                except Exception as e:
+                    print(f"Warning: touch failed for {mem_id}: {e}", file=sys.stderr)
+            
+            print(json.dumps({"result": f"Touched {touched} memories"}))
+
         elif action == "add":
             messages_json = sys.argv[2]
             user_id = sys.argv[3]
             agent_id = sys.argv[4]
 
             messages = json.loads(messages_json)
+
+            # UPDATE DEFENSE: Snapshot access payloads BEFORE add()
+            # Mem0's infer=True may update existing memories, potentially overwriting
+            # last_accessed_at. We capture the state before and restore after.
+            qdrant = QdrantClient(host='localhost', port=6333)
+            pre_add_payloads = {}
+            try:
+                points, _ = qdrant.scroll(collection_name='mem0', limit=1000, with_payload=True)
+                for pt in points:
+                    payload = pt.payload or {}
+                    if 'last_accessed_at' in payload and payload['last_accessed_at'] != 'never':
+                        pre_add_payloads[str(pt.id)] = payload['last_accessed_at']
+            except Exception as e:
+                print(f"Warning: failed to snapshot payloads before add: {e}", file=sys.stderr)
+
             client.add(messages, user_id=user_id, agent_id=agent_id)
+
+            # Restore last_accessed_at for any existing memories that were modified
+            restored = 0
+            if pre_add_payloads:
+                try:
+                    points, _ = qdrant.scroll(collection_name='mem0', limit=1000, with_payload=True)
+                    current_ids = {str(pt.id): pt.payload or {} for pt in points}
+                    for mem_id, original_la in pre_add_payloads.items():
+                        if mem_id in current_ids:
+                            current_la = current_ids[mem_id].get('last_accessed_at', '')
+                            if current_la != original_la and current_la != 'never':
+                                # last_accessed_at was changed by add() — restore it
+                                qdrant.set_payload(
+                                    collection_name='mem0',
+                                    payload={'last_accessed_at': original_la},
+                                    points=[mem_id]
+                                )
+                                restored += 1
+                except Exception as e:
+                    print(f"Warning: failed to restore payloads after add: {e}", file=sys.stderr)
+
+            if restored > 0:
+                print(f"[mem0] UPDATE DEFENSE: restored last_accessed_at for {restored} memories", file=sys.stderr)
             print(json.dumps({"result": "Fact stored."}))
 
         elif action == "get_all":
