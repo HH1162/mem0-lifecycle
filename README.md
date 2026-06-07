@@ -178,6 +178,79 @@ When Mem0's `add(infer=True)` updates existing memories, it may overwrite `last_
 
 ---
 
+## Directory Configuration
+
+This plugin requires three directories to be configured via environment variables or `mem0.json`:
+
+### 1. Mem0 Server Directory (`<mem0-dir>`)
+
+Where you cloned and set up the Mem0 server:
+
+```bash
+# Set via environment variable
+export MEM0_SERVER="<mem0-dir>/mem0_server.py"
+
+# Or in ~/.hermes/mem0.json
+{
+  "mem0_server": "<mem0-dir>/mem0_server.py"
+}
+```
+
+**What's inside `<mem0-dir>`:**
+- `mem0_server.py` — the custom server script with decay, track, touch commands
+- `.venv/` — Python virtual environment for Mem0 dependencies
+
+### 2. Mem0 Python Interpreter (`<mem0-venv>`)
+
+The Python executable from the Mem0 virtual environment:
+
+```bash
+# Set via environment variable
+export MEM0_PYTHON="<mem0-venv>/bin/python3"
+
+# Or in ~/.hermes/mem0.json
+{
+  "mem0_python": "<mem0-venv>/bin/python3"
+}
+```
+
+**Note**: This must be the Python inside the `.venv/` directory where Mem0 is installed, not your system Python.
+
+### 3. Embedder Model Directory (`<model-path>`)
+
+Path to the local BGE embedding model (or use a model name from HuggingFace):
+
+```bash
+# Set via environment variable
+export EMBEDDER_MODEL="<model-path>/bge-large-zh-v1.5"
+
+# Or in ~/.hermes/mem0.json
+{
+  "embedder_model": "<model-path>/bge-large-zh-v1.5"
+}
+```
+
+**Note**: If you use a model name (e.g., `"bge-large-zh-v1.5"`), it will be downloaded from HuggingFace on first use. For offline mode, provide the full local path.
+
+### Example Configuration
+
+```json
+// ~/.hermes/mem0.json
+{
+  "mode": "local",
+  "mem0_server": "/path/to/mem0/mem0_server.py",
+  "mem0_python": "/path/to/mem0/.venv/bin/python3",
+  "embedder_model": "/path/to/models/bge-large-zh-v1.5",
+  "llm_base_url": "http://localhost:1234/v1",
+  "llm_model": "qwen3",
+  "embedding_dims": 1024,
+  "qdrant_host": "localhost",
+  "qdrant_port": 6333
+}
+```
+
+---
+
 ## Installation
 
 ```bash
