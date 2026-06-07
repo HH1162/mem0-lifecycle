@@ -47,16 +47,24 @@ Agent ←→ Mem0 Plugin (bridge) ←→ Mem0 SDK ←→ Qdrant
 
 Instead of retrieving top_k=5 directly, we fetch top_k=20 from Qdrant. This gives us enough context to identify duplicates and conflicts before injecting anything into the prompt.
 
-**Step 2: Dual-Threshold Deduplication**
+**Step 2: Hash Pre-Scan + Dual-Threshold Deduplication**
 
-Using `SequenceMatcher` text similarity (no extra dependencies, no model loading):
+**Phase 1 — Hash Pre-Scan (O(N) exact dedup)**: Before any cosine comparison, each memory text is normalized (strip punctuation, collapse whitespace, lowercase) and hashed with MD5. Hash collisions are marked as **shadow** immediately — no cosine computation needed. This completely eliminates false negatives from punctuation/whitespace/case differences (e.g., "dark theme!" vs "dark theme.").
 
-| Similarity | Text Match | Action |
-|-----------|-----------|--------|
-| > 0.95 | Exact match (after removing punctuation/spaces) | Discard as **shadow** — pure redundant copy |
-| > 0.95 | Text differs | Retain as **conflict** — likely old vs new version |
-| 0.85 – 0.95 | Any | Retain + mark conflict |
-| ≤ 0.85 | Any | Normal injection, no conflict |
+**Timestamp backfill**: If a shadow memory has a newer `updated_at` than the retained entry, the retained entry's timestamp is backfilled so subsequent conflict resolution sees the latest state.
+
+**Phase 2 — Cosine Similarity (O(N²) semantic dedup)**: Only non-shadowed memories enter the cosine loop with `bge-large-zh-v1.5` embeddings:
+
+| Cosine | Action |
+|--------|--------|
+| > 0.92 | **HIGH conflict** — only track winner, freeze loser |
+| 0.75 – 0.92 | Run **Config Check** (entity extraction) for promotion |
+| < 0.75 | Normal injection, no conflict |
+
+**Config Check with Entity Type Tiering**: When cosine is in the 0.75–0.92 range, entity triples (IP, port, version, URL, path) are extracted and compared:
+- **endpoint** (IP/Port/URL): Always promoted to HIGH — these are globally unique
+- **version/path/hostname**: Promoted to HIGH only if cosine ≥ 0.85 — allows multi-version coexistence (e.g., Python 3.9 and 3.11)
+- **other**: Remains MEDIUM — both tracked symmetrically
 
 **Critical**: Qdrant's original similarity order is preserved. We never re-sort by `updated_at` — that would inject irrelevant memories just because they're recent.
 

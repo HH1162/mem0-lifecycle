@@ -225,7 +225,7 @@ def get_memory_client():
         'embedder': {
             'provider': 'huggingface',
             'config': {
-                'model': '/home/herocco/bge/bge-large-zh-v1.5'
+                'model': 'bge-large-zh-v1.5'  # local path or model name
             }
         },
         'vector_store': {

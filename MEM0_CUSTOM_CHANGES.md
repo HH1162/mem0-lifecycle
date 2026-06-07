@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档记录了 `/media/data/mem0/mem0_server.py` 的所有自定义修改，用于解决 Mem0 记忆衰减系统中的时间锚点问题。
+本文档记录了 `<mem0-dir>/mem0_server.py` 的所有自定义修改，用于解决 Mem0 记忆衰减系统中的时间锚点问题。
 
 ## 环境信息
 
@@ -16,7 +16,7 @@
 
 ### 1. HuggingFace FutureWarning 修复
 
-**文件**: `/media/data/mem0/.venv/lib/python3.11/site-packages/mem0/embeddings/huggingface.py`
+**文件**: `<mem0-venv>/lib/python3.11/site-packages/mem0/embeddings/huggingface.py`
 **行号**: L27
 **修改内容**:
 ```python
@@ -33,7 +33,7 @@ get_embedding_dimension()
 
 ### 2. 时间锚点 Gap 补偿机制 ⭐
 
-**文件**: `/media/data/mem0/mem0_server.py`
+**文件**: `<mem0-dir>/mem0_server.py`
 **函数**: `update_anchor_time()` (L78-166)
 **修改日期**: 2026-06-07
 
@@ -168,8 +168,8 @@ effective_days = max(0, raw_days - time_offset_days)
 
 ## 备份文件
 
-- `/media/data/mem0/mem0_server.py.bak.202605312159` - 原始版本
-- `/media/data/mem0/mem0_server.py.bak.20260607` - 修改前版本
+- `<mem0-dir>/mem0_server.py.bak.202605312159` - 原始版本
+- `<mem0-dir>/mem0_server.py.bak.20260607` - 修改前版本
 
 ---
 
@@ -179,7 +179,7 @@ effective_days = max(0, raw_days - time_offset_days)
 
 ```bash
 # 语法检查
-python3 -c "import ast; ast.parse(open('/media/data/mem0/mem0_server.py').read())"
+python3 -c "import ast; ast.parse(open('<mem0-dir>/mem0_server.py').read())"
 
 # 逻辑验证
 python3 << 'EOF'
@@ -202,7 +202,7 @@ EOF
 
 ```bash
 # 模拟离线30天重启
-/media/data/mem0/.venv/bin/python3 << 'EOF'
+<mem0-venv>/bin/python3 << 'EOF'
 import json
 import os
 from datetime import datetime, timezone, timedelta
@@ -277,7 +277,7 @@ EOF
 
 ### 4. Search/Track 解耦 + touch 子命令
 
-**文件**: `/media/data/mem0/mem0_server.py`
+**文件**: `<mem0-dir>/mem0_server.py`
 **修改日期**: 2026-06-07
 
 #### 问题描述
@@ -326,7 +326,7 @@ Shadow IDs 仅执行 `touch`，防止 `access_count` 无限增长。
 
 ### 6. UPDATE 防御（快照恢复）
 
-**文件**: `/media/data/mem0/mem0_server.py`
+**文件**: `<mem0-dir>/mem0_server.py`
 **函数**: `add()` action
 **修改日期**: 2026-06-07
 
@@ -356,7 +356,7 @@ for mem_id, original_la in pre_add_payloads.items():
 
 ### 7. 性能优化
 
-**文件**: `/media/data/mem0/mem0_server.py`
+**文件**: `<mem0-dir>/mem0_server.py`
 **修改日期**: 2026-06-07
 
 | 优化 | 效果 |
@@ -376,11 +376,11 @@ for mem_id, original_la in pre_add_payloads.items():
 
 ```bash
 # 检查是否需要恢复
-grep "get_sentence_embedding_dimension" /media/data/mem0/.venv/lib/python3.11/site-packages/mem0/embeddings/huggingface.py
+grep "get_sentence_embedding_dimension" <mem0-venv>/lib/python3.11/site-packages/mem0/embeddings/huggingface.py
 
 # 如果需要，重新 patch
 sed -i 's/get_sentence_embedding_dimension/get_embedding_dimension/g' \
-    /media/data/mem0/.venv/lib/python3.11/site-packages/mem0/embeddings/huggingface.py
+    <mem0-venv>/lib/python3.11/site-packages/mem0/embeddings/huggingface.py
 ```
 
 ### 监控
