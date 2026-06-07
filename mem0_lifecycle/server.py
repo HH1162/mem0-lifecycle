@@ -24,6 +24,7 @@ Cleanup config:
 """
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -36,13 +37,145 @@ HALF_LIFE_DAYS = 7.0       # Exponential decay half-life (days)
 CLEANUP_THRESHOLD = 0.05   # Memories with weighted_score < this are candidates for deletion
 ACCESS_COUNT_CAP = 255     # Hard cap on access_count — prevents unbounded growth
 
+# --- Time anchor: freezes decay while machine is offline ---
 
-def compute_weighted_score(access_count, last_accessed_iso):
-    """Exponential decay: score = min(count, CAP) * 0.5^(days_since / half_life)
+STATE_FILE = os.path.expanduser("~/.hermes/mem0_state.json")
 
-    Prevents infinite inflation: access_count is capped at 255, so even a
-    memory searched thousands of times has a bounded score.
-    Combined with half-life decay, old memories naturally fade to zero.
+
+def get_anchor_time():
+    """Get the system's last-active timestamp (time anchor).
+
+    This is the reference point for all decay calculations.
+    While the machine is offline, this timestamp does not advance,
+    effectively freezing memory decay during downtime.
+
+    Includes sanity check: if the stored anchor or system clock is
+    before MIN_VALID_YEAR, it is considered corrupted (e.g. CMOS
+    battery failure, NTP desync) and a safe fallback is used.
+    """
+    MIN_VALID_YEAR = 2024
+
+    try:
+        if os.path.exists(STATE_FILE):
+            state = json.loads(open(STATE_FILE).read())
+            ts = state.get("last_active", "")
+            if ts:
+                dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt.year >= MIN_VALID_YEAR:
+                    return dt
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc)
+    if now.year >= MIN_VALID_YEAR:
+        return now
+    # Extreme fallback: system clock itself is broken (e.g. CMOS dead)
+    return datetime(MIN_VALID_YEAR, 1, 1, tzinfo=timezone.utc)
+
+
+def update_anchor_time():
+    """Called on search/add to advance the time anchor.
+
+    Only invoked when the user is actively interacting with the system.
+    During downtime, this is never called, so the anchor stays frozen.
+
+    Offline gap handling:
+    If the gap between old anchor and now exceeds 36 hours (machine was offline),
+    we shift ALL last_accessed_at timestamps in Qdrant forward by the gap duration.
+    This preserves the relative distance between anchor and last_accessed_at,
+    preventing offline time from being counted as "memory idle time".
+
+    Example: machine off for 30 days
+      Before: last_accessed_at=Day0, anchor=Day0 → effective_days=0
+      After:  last_accessed_at=Day30, anchor=Day30 → effective_days=0 ✓
+    """
+    from datetime import timedelta
+
+    try:
+        now = datetime.now(timezone.utc)
+
+        # Read old anchor
+        old_anchor = None
+        if os.path.exists(STATE_FILE):
+            try:
+                state = json.loads(open(STATE_FILE).read())
+                ts = state.get("last_active", "")
+                if ts:
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt.year >= 2024:
+                        old_anchor = dt
+            except Exception:
+                pass
+
+        # If no valid old anchor, just write now and return
+        if old_anchor is None:
+            state = {"last_active": now.isoformat()}
+            tmp = STATE_FILE + ".tmp"
+            open(tmp, 'w').write(json.dumps(state, indent=2))
+            os.replace(tmp, STATE_FILE)
+            return
+
+        # Calculate gap
+        gap_seconds = (now - old_anchor).total_seconds()
+        gap_hours = gap_seconds / 3600
+
+        if gap_hours > 36:
+            # Machine was offline for more than 1.5 days.
+            # Shift all last_accessed_at timestamps forward by gap days.
+            gap_days = gap_seconds / 86400
+
+            try:
+                qdrant = QdrantClient(host='localhost', port=6333)
+                # Scroll returns (points_list, next_offset), not count
+                points, next_offset = qdrant.scroll(collection_name='mem0', limit=1000, with_payload=True)
+                shifted = 0
+                for pt in points:
+                    payload = pt.payload or {}
+                    la = payload.get('last_accessed_at')
+                    if la and la != 'never':
+                        try:
+                            la_dt = datetime.fromisoformat(la.replace('Z', '+00:00'))
+                            if la_dt.tzinfo is None:
+                                la_dt = la_dt.replace(tzinfo=timezone.utc)
+                            new_la = la_dt + timedelta(days=gap_days)
+                            qdrant.set_payload(
+                                collection_name='mem0',
+                                payload={'last_accessed_at': new_la.isoformat()},
+                                points=[str(pt.id)]
+                            )
+                            shifted += 1
+                        except Exception:
+                            pass
+                print(f"[mem0] Offline gap={gap_hours:.0f}h, shifted {shifted} memories by +{gap_days:.1f} days", file=sys.stderr)
+            except Exception as e:
+                print(f"[mem0] Warning: failed to shift timestamps after {gap_hours:.0f}h gap: {e}", file=sys.stderr)
+
+        # Update anchor to now
+        state = {"last_active": now.isoformat()}
+        tmp = STATE_FILE + ".tmp"
+        open(tmp, 'w').write(json.dumps(state, indent=2))
+        os.replace(tmp, STATE_FILE)
+
+    except Exception as e:
+        # Never block search/add on anchor update failure
+        print(f"[mem0] Warning: update_anchor_time failed: {e}", file=sys.stderr)
+        pass
+
+
+def compute_weighted_score(access_count, last_accessed_iso, anchor_time=None):
+    """Exponential decay based on system active time, not physical wall-clock time.
+
+    score = min(access_count, CAP) * 0.5^(effective_days / half_life)
+
+    effective_days = (anchor_time - last_accessed_at)
+
+    When anchor_time is None, defaults to current wall-clock time.
+    During cleanup/stats, anchor_time is explicitly passed to ensure
+    consistent scoring across all memories in a single run.
 
     Timestamp parsing uses Python native fromisoformat + tzinfo check for
     robust handling of UTC, timezone-aware, naive, Z-suffix, and negative-offset
@@ -60,8 +193,15 @@ def compute_weighted_score(access_count, last_accessed_iso):
         last_dt = datetime.fromisoformat(ts)
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        days = max(0, (now - last_dt).total_seconds() / 86400)
+
+        # Use anchor_time (last system activity) instead of wall-clock now()
+        # This freezes decay while the machine is offline
+        if anchor_time is None:
+            anchor_time = get_anchor_time()
+        elif anchor_time.tzinfo is None:
+            anchor_time = anchor_time.replace(tzinfo=timezone.utc)
+
+        days = max(0, (anchor_time - last_dt).total_seconds() / 86400)
         return float(min(access_count, ACCESS_COUNT_CAP)) * (0.5 ** (days / HALF_LIFE_DAYS))
     except Exception:
         # Timestamp parse failure -> treat as expired to avoid immortal zombies
@@ -73,12 +213,18 @@ def get_memory_client():
 
     Replace the values below with your own deployment settings.
     See https://docs.mem0.ai/quick-start for full configuration options.
+
+    ⚡ Force offline mode — prevent transformers/hf_hub from downloading
+    config files every time the model loads. Model files are already local.
     """
+    import os
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
     config = {
         'llm': {
             'provider': 'openai',
             'config': {
-                'api_key': 'your-api-key-here',
+                'api_key': 'local',
                 'openai_base_url': 'http://localhost:1234/v1',
                 'model': 'qwen3'
             }
@@ -86,7 +232,7 @@ def get_memory_client():
         'embedder': {
             'provider': 'huggingface',
             'config': {
-                'model': '/path/to/embedding-model'
+                'model': '/home/herocco/bge/bge-large-zh-v1.5'
             }
         },
         'vector_store': {
@@ -98,28 +244,6 @@ def get_memory_client():
                 'port': 6333
             }
         },
-        'custom_instructions': """
-## Storage Rules (Highest Priority)
-
-This is a working AI assistant. Only store information that retains value across sessions.
-
-STORE:
-- User preferences, habits, style requirements
-- Iron rules, red lines, taboos
-- Environment facts: tool paths, service ports, venv locations
-- Technical decisions and architecture choices
-- Verified stable patterns and pitfalls
-- User identity and project information
-
-DO NOT STORE:
-- Single-session task progress or intermediate state
-- Code modification logs (belong in skills, not memory)
-- One-time debugging conclusions (unless verified as a stable pattern)
-- Emotional descriptions ("nervous", "frustrated")
-- Temporary file paths, commit SHAs, PR numbers, branch names
-- Content already fully covered by USER.md or skills
-- Speculation or unconfirmed hypotheses
-"""
     }
     return Memory.from_config(config)
 
@@ -167,8 +291,12 @@ def batch_get_access_payload(qdrant, mem_ids):
                 payload.get('last_accessed_at', 'never')
             )
         return result
-    except Exception:
-        return {}
+    except Exception as e:
+        # CRITICAL: Never swallow Qdrant errors silently.
+        # If we return {} here, cleanup will see ac=0 for ALL memories
+        # and delete everything past the grace period (Fail-Deadly).
+        # Raising forces the caller to abort (Fail-Safe).
+        raise RuntimeError(f"Qdrant batch retrieve failed for {len(mem_ids)} memories: {e}")
 
 
 def main():
@@ -177,6 +305,10 @@ def main():
         sys.exit(1)
 
     action = sys.argv[1]
+
+    # Advance time anchor on user-facing actions (search/add)
+    if action in ("search", "add"):
+        update_anchor_time()
 
     try:
         client = get_memory_client()
@@ -192,7 +324,7 @@ def main():
                 filters={'user_id': user_id},
                 top_k=top_k,
                 rerank=rerank,
-                threshold=0.4
+                threshold=0.1
             )
 
             # Track access frequency for each matched memory
@@ -214,10 +346,10 @@ def main():
                                     },
                                     points=[mem_id]
                                 )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                print(f"Warning: track access failed for {mem_id}: {e}", file=sys.stderr)
 
-            print(json.dumps(results))
+            print(json.dumps(results, default=str))
 
         elif action == "add":
             messages_json = sys.argv[2]
@@ -248,6 +380,9 @@ def main():
             user_id = sys.argv[2] if len(sys.argv) > 2 else "example-user"
             qdrant = QdrantClient(host='localhost', port=6333)
 
+            # Use time anchor for consistent scoring (not wall-clock now)
+            anchor = get_anchor_time()
+
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
@@ -274,7 +409,7 @@ def main():
                 if ac > max_access:
                     max_access = ac
 
-                w = compute_weighted_score(ac, la)
+                w = compute_weighted_score(ac, la, anchor_time=anchor)
                 total_weighted += w
                 max_weighted = max(max_weighted, w)
 
@@ -298,6 +433,8 @@ def main():
             top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 10
             qdrant = QdrantClient(host='localhost', port=6333)
 
+            anchor = get_anchor_time()
+
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
@@ -309,7 +446,7 @@ def main():
             for m in results:
                 mem_id = str(m.get('id', ''))
                 ac, la = payload_map.get(mem_id, (0, 'never'))
-                w = compute_weighted_score(ac, la)
+                w = compute_weighted_score(ac, la, anchor_time=anchor)
                 with_stats.append({
                     'id': mem_id,
                     'memory': m.get('memory', '')[:120],
@@ -329,21 +466,39 @@ def main():
             user_id = 'example-user'
             threshold = CLEANUP_THRESHOLD
 
-            # Parse optional threshold
+            skip_next = False
             for i, arg in enumerate(args):
+                if skip_next:
+                    skip_next = False
+                    continue
+
                 if arg == '--threshold' and i + 1 < len(args):
-                    threshold = float(args[i + 1])
-                elif arg not in ('--dry-run', '--threshold') and not arg.startswith('-'):
+                    try:
+                        threshold = float(args[i + 1])
+                        skip_next = True  # Mark value as consumed so it won't become user_id
+                    except ValueError:
+                        pass
+                elif not arg.startswith('-'):
                     user_id = arg
 
             qdrant = QdrantClient(host='localhost', port=6333)
+
+            anchor = get_anchor_time()
 
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
             # BATCH retrieve all payloads in one call (eliminates N+1 query problem)
+            # Circuit breaker: if Qdrant is down, abort cleanup entirely (Fail-Safe).
             mem_ids = [str(m.get('id', '')) for m in results if m.get('id')]
-            payload_map = batch_get_access_payload(qdrant, mem_ids)
+            try:
+                payload_map = batch_get_access_payload(qdrant, mem_ids)
+            except RuntimeError as e:
+                print(json.dumps({
+                    "error": str(e),
+                    "action": "ABORT_CLEANUP_TO_PREVENT_MASS_DELETION"
+                }))
+                sys.exit(1)
 
             candidates = []
             kept = []
@@ -351,9 +506,11 @@ def main():
             for m in results:
                 mem_id = str(m.get('id', ''))
                 ac, la = payload_map.get(mem_id, (0, 'never'))
-                w = compute_weighted_score(ac, la)
+                w = compute_weighted_score(ac, la, anchor_time=anchor)
 
-                # Grace period: newly created memories (< 14 days old) are protected
+                # Grace period: newly created memories (< 14 days old) are protected.
+                # Uses anchor_time as single source of truth instead of datetime.now()
+                # to remain resilient against system clock drift (NTP desync, CMOS failure).
                 grace_protected = False
                 created_at = m.get('created_at', '')
                 if created_at:
@@ -362,8 +519,7 @@ def main():
                         ca_dt = datetime.fromisoformat(ca_ts)
                         if ca_dt.tzinfo is None:
                             ca_dt = ca_dt.replace(tzinfo=timezone.utc)
-                        now = datetime.now(timezone.utc)
-                        days_old = (now - ca_dt).total_seconds() / 86400
+                        days_old = (anchor - ca_dt).total_seconds() / 86400
                         grace_protected = days_old < 14
                     except Exception:
                         # If timestamp parsing fails, default to protecting the memory
