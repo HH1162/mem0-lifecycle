@@ -325,4 +325,40 @@ Check stderr logs for `[mem0] Offline gap=` messages. Verify:
 
 ## License
 
+## Bug Fixes
+
+### [Fixed] top_k=20 Limit Causing Incomplete Memory Cleanup (2025-06-13)
+
+**Problem**: The `client.get_all()` method used in `stats`, `least_used`, and `cleanup` commands was limited to returning only the most recent 20 memories due to Mem0's internal `top_k` parameter. This caused the cleanup process to miss thousands of stale memories that were actually eligible for deletion.
+
+**Root Cause**: 
+- Mem0 SDK's `get_all()` relies on vector similarity search with a default `top_k=20` limit
+- When the memory database contains 1000+ entries, only the 20 most recently accessed are scanned
+- Old memories (even if unused for weeks) were never evaluated for cleanup
+
+**Solution**: 
+- Replaced `client.get_all()` with direct Qdrant Scroll API (`qdrant.scroll()`) which supports pagination and full collection scanning
+- Added `scroll_all_memories()` function that paginates through all memories in batches of 100
+- Removed redundant `batch_get_access_payload()` calls since payload is returned directly with scroll results
+- Hardcoded `collection_name='mem0'` to prevent accidental cross-collection operations
+
+**Impact**: 
+- Before: Only 20 memories scanned per cleanup run (938 actual memories for hermes-user, 396 for wechat)
+- After: All 1334+ memories scanned, properly identifying 6+ eligible deletions per run
+- Grace Period (<14 days), Circuit Breaker, and Track Frozen protections remain intact
+
+**Files Changed**: `mem0_lifecycle/server.py`
+
+### [Enhanced] Multi-User Cleanup Support (2025-06-13)
+
+**Feature**: Added `--all-users` flag to the `cleanup` command to support simultaneous cleanup across multiple user contexts (CLI user + WeChat gateway users).
+
+**Usage**:
+```bash
+python server.py cleanup --all-users
+```
+
+**Files Changed**: `mem0_lifecycle/server.py`
+
+
 MIT
